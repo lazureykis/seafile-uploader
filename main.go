@@ -29,13 +29,65 @@ var (
 func ConfigureApp() {
 	dotenv.Go()
 
+	token = os.Getenv("SEAFILE_TOKEN")
 	seafile_url = os.Getenv("SEAFILE_URL")
+	listen = os.Getenv("SEAFILE_PROXY_LISTEN")
 
-	if len(os.Getenv("SEAFILE_PROXY_LISTEN")) > 0 {
-		listen = os.Getenv("SEAFILE_PROXY_LISTEN")
-	} else {
+	if seafile_url == "" {
+		log.Fatalln("SEAFILE_URL is blank.\nYou should pass url to your seafile host in SEAFILE_URL variable.\n For example: SEAFILE=https://yourhost.com")
+	}
+
+	if listen == "" {
 		listen = ":8881"
 	}
+
+	if len(os.Args) < 2 || os.Args[1] != "login" {
+		if token == "" {
+			log.Fatalln("SEAFILE_TOKEN is blank.\nYou should pass SEAFILE_TOKEN environment variable.\nRun 'seafile login your_username your_password' to get authentication token.")
+		} else {
+			if err := PingAuth(); err != nil {
+				log.Fatalln(err)
+			}
+		}
+	}
+}
+
+// curl -H 'Authorization: Token 24fd3c026886e3121b2ca630805ed425c272cb96' https://cloud.seafile.com/api2/auth/ping/
+// "pong"
+func PingAuth() error {
+	method_url := seafile_url + "/api2/auth/ping/"
+
+	client := &http.Client{}
+
+	req, err := http.NewRequest("GET", method_url, nil)
+	if err != nil {
+		return err
+	}
+
+	req.Header.Add("Authorization", "Token "+token)
+	resp, err := client.Do(req)
+	if err != nil {
+		return err
+	}
+
+	reader := bufio.NewReader(resp.Body)
+	data, err := reader.ReadBytes('\n')
+	if err != nil && err != io.EOF {
+		return err
+	}
+
+	var jsonData string
+	err = json.Unmarshal(data, &jsonData)
+
+	if err != nil {
+		return err
+	}
+
+	if jsonData != "pong" {
+		return errors.New("Ping was replied with: " + string(data))
+	}
+
+	return nil
 }
 
 //
