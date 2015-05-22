@@ -24,6 +24,9 @@ var (
 
 	// TCP address to listen. For example: :8080
 	listen string
+
+	// All stored files remains in this library.
+	default_repo string
 )
 
 func ConfigureApp() {
@@ -50,16 +53,18 @@ func ConfigureApp() {
 			}
 		}
 	}
+
+	if err := GetDefaultRepo(); err != nil {
+		log.Fatalln(err)
+	}
 }
 
-// curl -H 'Authorization: Token 24fd3c026886e3121b2ca630805ed425c272cb96' https://cloud.seafile.com/api2/auth/ping/
-// "pong"
-func PingAuth() error {
-	method_url := seafile_url + "/api2/auth/ping/"
+func DoSeafileRequest(method, path string, v interface{}) error {
+	method_url := seafile_url + path
 
 	client := &http.Client{}
 
-	req, err := http.NewRequest("GET", method_url, nil)
+	req, err := http.NewRequest(method, method_url, nil)
 	if err != nil {
 		return err
 	}
@@ -76,15 +81,27 @@ func PingAuth() error {
 		return err
 	}
 
+	err = json.Unmarshal(data, &v)
+
+	if err != nil {
+		return err
+	}
+
+	return nil
+}
+
+// curl -H 'Authorization: Token 24fd3c026886e3121b2ca630805ed425c272cb96' https://cloud.seafile.com/api2/auth/ping/
+// "pong"
+func PingAuth() error {
 	var jsonData string
-	err = json.Unmarshal(data, &jsonData)
+	err := DoSeafileRequest("GET", "/api2/auth/ping/", &jsonData)
 
 	if err != nil {
 		return err
 	}
 
 	if jsonData != "pong" {
-		return errors.New("Ping was replied with: " + string(data))
+		return errors.New("Ping was replied with: " + jsonData)
 	}
 
 	return nil
@@ -147,6 +164,36 @@ func MaybeLoginRequest() {
 
 		os.Exit(0)
 	}
+}
+
+//
+// Get default library identifier
+//
+// curl -H 'Authorization: Token f2210dacd9c6ccb8133606d94ff8e61d99b477fd' "https://cloud.seafile.com/api2/default-repo/"
+// {
+//     "repo_id": "691b3e24-d05e-43cd-a9f2-6f32bd6b800e",
+//     "exists": true
+// }
+func GetDefaultRepo() error {
+	var dat map[string]interface{}
+
+	err := DoSeafileRequest("GET", "/api2/default-repo/", &dat)
+
+	if err != nil {
+		return err
+	}
+
+	if !(dat["exists"].(bool)) {
+		return errors.New("Repo doesn't exists")
+	}
+
+	default_repo = dat["repo_id"].(string)
+
+	if len(default_repo) != 36 {
+		return errors.New("Invalid default_repo: " + default_repo)
+	}
+
+	return nil
 }
 
 // Web-server part.
