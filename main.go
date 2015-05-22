@@ -2,6 +2,7 @@ package main
 
 import (
 	"bufio"
+	"bytes"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -9,6 +10,7 @@ import (
 	"html/template"
 	"io"
 	"log"
+	"mime/multipart"
 	"net/http"
 	"net/url"
 	"os"
@@ -204,6 +206,76 @@ func GetDefaultRepo() error {
 	return nil
 }
 
+// Gets link where to upload file.
+// GET https://cloud.seafile.com/api2/repos/{repo-id}/upload-link/
+// curl -H "Authorization: Token f2210dacd9c6ccb8133606d94ff8e61d99b477fd" https://cloud.seafile.com/api2/repos/99b758e6-91ab-4265-b705-925367374cf0/upload-link/
+// "http://cloud.seafile.com:8082/upload-api/ef881b22"
+func GetUploadLink(folder string) (string, error) {
+	var data string
+	err := DoSeafileRequest("GET", "/api2/repos/"+default_repo+"/upload-link/", &data)
+	if err != nil {
+		return "", err
+	}
+
+	return data, err
+}
+
+// UploadFile API request.
+// Errors:
+// 400 Bad request
+// 440 Invalid filename
+// 441 File already exists
+// 500 Internal server error
+//
+// Sample:
+// curl -H "Authorization: Token f2210dacd9c6ccb8133606d94ff8e61d99b477fd" -F file=@test.txt -F filename=test.txt -F parent_dir=/ http://cloud.seafile.com:8082/upload-api/ef881b22
+// "adc83b19e793491b1c6ea0fd8b46cd9f32e592fc"
+func UploadFile(upload_link string, src io.Reader, folder, filename string) error {
+	body := &bytes.Buffer{}
+	writer := multipart.NewWriter(body)
+	part, err := writer.CreateFormFile("file", filename)
+	if err != nil {
+		return err
+	}
+	_, err = io.Copy(part, src)
+
+	writer.WriteField("filename", filename)
+	writer.WriteField("parent_dir", folder)
+
+	err = writer.Close()
+	if err != nil {
+		return err
+	}
+
+	req, err := http.NewRequest("POST", upload_link, body)
+	if err != nil {
+		return err
+	}
+	req.Header.Add("Authorization", "Token "+token)
+	req.Header.Set("Content-Type", writer.FormDataContentType())
+
+	client := &http.Client{}
+
+	resp, err := client.Do(req)
+
+	if err != nil {
+		return err
+	}
+
+	// TODO: parse response.
+	rbody := &bytes.Buffer{}
+	_, err = rbody.ReadFrom(resp.Body)
+	if err != nil {
+		return err
+	}
+	resp.Body.Close()
+	fmt.Println(resp.StatusCode)
+	fmt.Println(resp.Header)
+	fmt.Println(rbody)
+
+	return nil
+}
+
 // Web-server part.
 
 //Display the named template
@@ -222,46 +294,57 @@ func uploadHandler(w http.ResponseWriter, r *http.Request) {
 		start := time.Now()
 		//get the multipart reader for the request.
 		reader, err := r.MultipartReader()
+		r.ParseMultipartForm(1024 * 1024 * 1024)
 
 		if err != nil {
 			http.Error(w, err.Error(), http.StatusInternalServerError)
 			return
 		}
 
-		//copy each part to destination.
-		for {
-			part, err := reader.NextPart()
-			if err == io.EOF {
-				break
-			}
+		if processHTTPFiles(w, reader) {
+			time_taken := time.Since(start)
 
-			//if part.FileName() is empty, skip this iteration.
-			if part.FileName() == "" {
-				continue
-			}
-			dst, err := os.Create("uploads/" + part.FileName())
-			defer dst.Close()
-
-			if err != nil {
-				http.Error(w, err.Error(), http.StatusInternalServerError)
-				return
-			}
-
-			if _, err := io.Copy(dst, part); err != nil {
-				http.Error(w, err.Error(), http.StatusInternalServerError)
-				return
-			}
+			//display success message.
+			msg := fmt.Sprintf("Upload successful. Time taken: %v", time_taken)
+			display(w, "upload", msg)
 		}
-
-		time_taken := time.Since(start)
-
-		//display success message.
-		msg := fmt.Sprintf("Upload successful. Time taken: %v", time_taken)
-		display(w, "upload", msg)
 
 	default:
 		w.WriteHeader(http.StatusMethodNotAllowed)
 	}
+}
+
+func processHTTPFiles(w http.ResponseWriter, r *multipart.Reader) bool {
+	//copy each part to destination.
+	for {
+		part, err := r.NextPart()
+		if err == io.EOF {
+			break
+		}
+
+		//if part.FileName() is empty, skip this iteration.
+		if part.FileName() == "" {
+			continue
+		}
+
+		upload_link, err := GetUploadLink("test")
+		if err != nil {
+			http.Error(w, err.Error(), http.StatusInternalServerError)
+			return false
+		}
+		fmt.Println(upload_link, err)
+
+		err = UploadFile(upload_link, part, "/test/", part.FileName())
+
+		if err != nil {
+			http.Error(w, err.Error(), http.StatusInternalServerError)
+			return false
+		}
+
+		part.Close()
+	}
+
+	return true
 }
 
 // Start web server after configuration.
