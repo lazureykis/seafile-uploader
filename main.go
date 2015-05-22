@@ -6,12 +6,17 @@ import (
 	"errors"
 	"fmt"
 	"github.com/lazureykis/dotenv"
+	"html/template"
 	"io"
 	"log"
 	"net/http"
 	"net/url"
 	"os"
+	"time"
 )
+
+//Compile templates on start
+var templates = template.Must(template.ParseFiles("tmpl/upload.html"))
 
 // Application configuration
 
@@ -201,13 +206,70 @@ func GetDefaultRepo() error {
 
 // Web-server part.
 
+//Display the named template
+func display(w http.ResponseWriter, tmpl string, data interface{}) {
+	templates.ExecuteTemplate(w, tmpl+".html", data)
+}
+
 func uploadHandler(w http.ResponseWriter, r *http.Request) {
-	fmt.Fprint(w, "")
+	switch r.Method {
+	//GET displays the upload form.
+	case "GET":
+		display(w, "upload", nil)
+
+	//POST takes the uploaded file(s) and saves it to disk.
+	case "POST":
+		start := time.Now()
+		//get the multipart reader for the request.
+		reader, err := r.MultipartReader()
+
+		if err != nil {
+			http.Error(w, err.Error(), http.StatusInternalServerError)
+			return
+		}
+
+		//copy each part to destination.
+		for {
+			part, err := reader.NextPart()
+			if err == io.EOF {
+				break
+			}
+
+			//if part.FileName() is empty, skip this iteration.
+			if part.FileName() == "" {
+				continue
+			}
+			dst, err := os.Create("uploads/" + part.FileName())
+			defer dst.Close()
+
+			if err != nil {
+				http.Error(w, err.Error(), http.StatusInternalServerError)
+				return
+			}
+
+			if _, err := io.Copy(dst, part); err != nil {
+				http.Error(w, err.Error(), http.StatusInternalServerError)
+				return
+			}
+		}
+
+		time_taken := time.Since(start)
+
+		//display success message.
+		msg := fmt.Sprintf("Upload successful. Time taken: %v", time_taken)
+		display(w, "upload", msg)
+
+	default:
+		w.WriteHeader(http.StatusMethodNotAllowed)
+	}
 }
 
 // Start web server after configuration.
 func StartWebServer() {
 	http.HandleFunc("/upload", uploadHandler)
+
+	//static file handler.
+	http.Handle("/assets/", http.StripPrefix("/assets/", http.FileServer(http.Dir("assets"))))
 
 	log.Printf("Started on %s.\n", listen)
 	log.Fatal(http.ListenAndServe(listen, nil))
