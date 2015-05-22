@@ -74,6 +74,7 @@ func DoSeafileRequest(method, path string, v interface{}) error {
 	if err != nil {
 		return err
 	}
+	defer resp.Body.Close()
 
 	reader := bufio.NewReader(resp.Body)
 	data, err := reader.ReadBytes('\n')
@@ -119,6 +120,8 @@ func Login(username, password string) (err error) {
 	if err != nil {
 		return err
 	}
+
+	defer resp.Body.Close()
 
 	bodyReader := bufio.NewReader(resp.Body)
 	var bodyData []byte
@@ -204,7 +207,7 @@ func uploadHandler(w http.ResponseWriter, r *http.Request) {
 
 // Start web server after configuration.
 func StartWebServer() {
-	http.HandleFunc("/", uploadHandler)
+	http.HandleFunc("/upload", uploadHandler)
 
 	log.Printf("Started on %s.\n", listen)
 	log.Fatal(http.ListenAndServe(listen, nil))
