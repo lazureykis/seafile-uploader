@@ -34,6 +34,9 @@ var (
 
 	// All stored files remains in this library.
 	default_repo string
+
+	// Seafile Upload API HTTP address
+	upload_link string
 )
 
 func ConfigureApp() {
@@ -62,6 +65,10 @@ func ConfigureApp() {
 	}
 
 	if err := GetDefaultRepo(); err != nil {
+		log.Fatalln(err)
+	}
+
+	if err := GetUploadLink(); err != nil {
 		log.Fatalln(err)
 	}
 }
@@ -210,14 +217,8 @@ func GetDefaultRepo() error {
 // GET https://cloud.seafile.com/api2/repos/{repo-id}/upload-link/
 // curl -H "Authorization: Token f2210dacd9c6ccb8133606d94ff8e61d99b477fd" https://cloud.seafile.com/api2/repos/99b758e6-91ab-4265-b705-925367374cf0/upload-link/
 // "http://cloud.seafile.com:8082/upload-api/ef881b22"
-func GetUploadLink(folder string) (string, error) {
-	var data string
-	err := DoSeafileRequest("GET", "/api2/repos/"+default_repo+"/upload-link/", &data)
-	if err != nil {
-		return "", err
-	}
-
-	return data, err
+func GetUploadLink() error {
+	return DoSeafileRequest("GET", "/api2/repos/"+default_repo+"/upload-link/", &upload_link)
 }
 
 // UploadFile API request.
@@ -230,50 +231,61 @@ func GetUploadLink(folder string) (string, error) {
 // Sample:
 // curl -H "Authorization: Token f2210dacd9c6ccb8133606d94ff8e61d99b477fd" -F file=@test.txt -F filename=test.txt -F parent_dir=/ http://cloud.seafile.com:8082/upload-api/ef881b22
 // "adc83b19e793491b1c6ea0fd8b46cd9f32e592fc"
-func UploadFile(upload_link string, src io.Reader, folder, filename string) error {
-	body := &bytes.Buffer{}
-	writer := multipart.NewWriter(body)
-	part, err := writer.CreateFormFile("file", filename)
-	if err != nil {
-		return err
-	}
-	_, err = io.Copy(part, src)
+func UploadFile(src io.Reader, folder, filename string) chan (error) {
+	ch := make(chan error)
+	go func() {
+		log.Println("Uploading", folder+filename)
 
-	writer.WriteField("filename", filename)
-	writer.WriteField("parent_dir", folder)
+		body := &bytes.Buffer{}
+		writer := multipart.NewWriter(body)
+		part, err := writer.CreateFormFile("file", filename)
+		if err != nil {
+			ch <- err
+			return
+		}
+		_, err = io.Copy(part, src)
 
-	err = writer.Close()
-	if err != nil {
-		return err
-	}
+		writer.WriteField("filename", filename)
+		writer.WriteField("parent_dir", folder)
 
-	req, err := http.NewRequest("POST", upload_link, body)
-	if err != nil {
-		return err
-	}
-	req.Header.Add("Authorization", "Token "+token)
-	req.Header.Set("Content-Type", writer.FormDataContentType())
+		err = writer.Close()
+		if err != nil {
+			ch <- err
+			return
+		}
 
-	client := &http.Client{}
+		req, err := http.NewRequest("POST", upload_link, body)
+		if err != nil {
+			ch <- err
+			return
+		}
+		req.Header.Add("Authorization", "Token "+token)
+		req.Header.Set("Content-Type", writer.FormDataContentType())
 
-	resp, err := client.Do(req)
+		client := &http.Client{}
 
-	if err != nil {
-		return err
-	}
+		resp, err := client.Do(req)
 
-	// TODO: parse response.
-	rbody := &bytes.Buffer{}
-	_, err = rbody.ReadFrom(resp.Body)
-	if err != nil {
-		return err
-	}
-	resp.Body.Close()
-	fmt.Println(resp.StatusCode)
-	fmt.Println(resp.Header)
-	fmt.Println(rbody)
+		if err != nil {
+			ch <- err
+			return
+		}
 
-	return nil
+		// TODO: parse response.
+		rbody := &bytes.Buffer{}
+		_, err = rbody.ReadFrom(resp.Body)
+		if err != nil {
+			ch <- err
+			return
+		}
+		resp.Body.Close()
+		log.Println("Saved", rbody, folder+filename)
+
+		ch <- nil
+		return
+	}()
+
+	return ch
 }
 
 // Web-server part.
@@ -283,7 +295,10 @@ func display(w http.ResponseWriter, tmpl string, data interface{}) {
 	templates.ExecuteTemplate(w, tmpl+".html", data)
 }
 
+var MAX_FORM_SIZE int64 = 1024 * 1024 * 1024 // 1GB
+
 func uploadHandler(w http.ResponseWriter, r *http.Request) {
+	log.Println(r.Method, r.RequestURI)
 	switch r.Method {
 	//GET displays the upload form.
 	case "GET":
@@ -292,56 +307,67 @@ func uploadHandler(w http.ResponseWriter, r *http.Request) {
 	//POST takes the uploaded file(s) and saves it to disk.
 	case "POST":
 		start := time.Now()
-		//get the multipart reader for the request.
-		reader, err := r.MultipartReader()
-		r.ParseMultipartForm(1024 * 1024 * 1024)
+		content_length := r.Header.Get("Content-Length")
+		log.Println("Received", content_length, "bytes")
+
+		err := r.ParseMultipartForm(MAX_FORM_SIZE)
 
 		if err != nil {
 			http.Error(w, err.Error(), http.StatusInternalServerError)
 			return
 		}
 
-		if processHTTPFiles(w, reader) {
+		form := r.MultipartForm
+		defer form.RemoveAll()
+
+		if processHTTPFiles(w, form) {
 			time_taken := time.Since(start)
 
 			//display success message.
 			msg := fmt.Sprintf("Upload successful. Time taken: %v", time_taken)
 			display(w, "upload", msg)
 		}
-
 	default:
 		w.WriteHeader(http.StatusMethodNotAllowed)
 	}
 }
 
-func processHTTPFiles(w http.ResponseWriter, r *multipart.Reader) bool {
-	//copy each part to destination.
-	for {
-		part, err := r.NextPart()
-		if err == io.EOF {
-			break
-		}
+func processHTTPFiles(w http.ResponseWriter, form *multipart.Form) bool {
+	var dir string
+	if len(form.Value["folder"]) > 0 {
+		dir = form.Value["folder"][0]
+	}
 
-		//if part.FileName() is empty, skip this iteration.
-		if part.FileName() == "" {
-			continue
-		}
+	if dir == "" {
+		dir = "/test/"
+	}
 
-		upload_link, err := GetUploadLink("test")
-		if err != nil {
-			http.Error(w, err.Error(), http.StatusInternalServerError)
-			return false
-		}
-		fmt.Println(upload_link, err)
-
-		err = UploadFile(upload_link, part, "/test/", part.FileName())
+	var channels []chan error
+	files := form.File["file"]
+	for i, f := range files {
+		//for each fileheader, get a handle to the actual file
+		file, err := files[i].Open()
+		defer file.Close()
 
 		if err != nil {
 			http.Error(w, err.Error(), http.StatusInternalServerError)
 			return false
 		}
 
-		part.Close()
+		channels = append(channels, UploadFile(file, dir, f.Filename))
+	}
+
+	var err error
+	for _, ch := range channels {
+		e := <-ch
+		if e != nil {
+			err = e
+		}
+	}
+
+	if err != nil {
+		http.Error(w, err.Error(), http.StatusInternalServerError)
+		return false
 	}
 
 	return true
