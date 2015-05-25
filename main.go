@@ -22,6 +22,7 @@ import (
 const (
 	UPLOADED_FILE_HASH_SIZE = 40
 	REPO_ID_SIZE            = 36
+	PATH_DOESNT_EXIST_MSG   = "Path does not exist"
 )
 
 // Application configuration
@@ -44,6 +45,14 @@ var (
 	// Seafile Upload API HTTP address
 	upload_link string
 )
+
+type FileSpec struct {
+	Id    string        `json:"id"`
+	MTime time.Duration `json:"mtime"`
+	Type  string        `json:"type"`
+	Name  string        `json:"name"`
+	Size  int64         `json:"size"`
+}
 
 func ConfigureApp() {
 	dotenv.Go()
@@ -79,43 +88,46 @@ func ConfigureApp() {
 	}
 }
 
-func DoSeafileRequest(method, path string, returnData interface{}) error {
+func DoSeafileRequest(method, path string) ([]byte, error) {
 	method_url := seafile_url + path
 
 	client := &http.Client{}
 
 	req, err := http.NewRequest(method, method_url, nil)
 	if err != nil {
-		return err
+		return nil, err
 	}
 
 	req.Header.Add("Authorization", "Token "+token)
 	resp, err := client.Do(req)
 	if err != nil {
-		return err
+		return nil, err
 	}
 	defer resp.Body.Close()
 
-	reader := bufio.NewReader(resp.Body)
-	data, err := reader.ReadBytes('\n')
+	data, err := ioutil.ReadAll(resp.Body)
 	if err != nil && err != io.EOF {
-		return err
+		return nil, err
 	}
 
-	err = json.Unmarshal(data, &returnData)
+	return data, nil
+}
+
+func DoSeafileRequestJSON(method, path string, returnJSON interface{}) error {
+	data, err := DoSeafileRequest(method, path)
 
 	if err != nil {
 		return err
 	}
 
-	return nil
+	return json.Unmarshal(data, &returnJSON)
 }
 
 // curl -H 'Authorization: Token 24fd3c026886e3121b2ca630805ed425c272cb96' https://cloud.seafile.com/api2/auth/ping/
 // "pong"
 func PingAuth() error {
 	var jsonData string
-	err := DoSeafileRequest("GET", "/api2/auth/ping/", &jsonData)
+	err := DoSeafileRequestJSON("GET", "/api2/auth/ping/", &jsonData)
 
 	if err != nil {
 		return err
@@ -200,7 +212,7 @@ func MaybeLoginRequest() {
 func GetDefaultRepo() error {
 	var dat map[string]interface{}
 
-	err := DoSeafileRequest("GET", "/api2/default-repo/", &dat)
+	err := DoSeafileRequestJSON("GET", "/api2/default-repo/", &dat)
 
 	if err != nil {
 		return err
@@ -217,6 +229,67 @@ func GetDefaultRepo() error {
 	}
 
 	return nil
+}
+
+// curl -H "Authorization: Token f2210dacd9c6ccb8133606d94ff8e61d9b477fd" -H 'Accept: application/json; indent=4' https://cloud.seafile.com/api2/repos/99b758e6-91ab-4265-b705-925367374cf0/dir/?p=/foo
+// If oid is the latest oid of the directory, returns "uptodate" , else returns
+// [
+// {
+//     "id": "0000000000000000000000000000000000000000",
+//     "type": "file",
+//     "name": "test1.c",
+//     "size": 0
+// },
+// {
+//     "id": "e4fe14c8cda2206bb9606907cf4fca6b30221cf9",
+//     "type": "dir",
+//     "name": "test_dir"
+// }
+// ]
+func ListDirectory(directory string) (err error, files []string) {
+	params := url.Values{"p": {directory}}
+	path := "/api2/repos/" + default_repo + "/dir/?" + params.Encode()
+
+	data, err := DoSeafileRequest("GET", path)
+	if err != nil {
+		return err, nil
+	}
+
+	var filespecs []FileSpec
+	if err := json.Unmarshal(data, &filespecs); err == nil {
+		for _, entry := range filespecs {
+			if entry.Type == "file" {
+				files = append(files, entry.Name)
+			}
+		}
+
+		return nil, files
+	}
+
+	msg := fmt.Sprintf("Unknown server response: %v", string(data))
+
+	var hash map[string]string
+	if err := json.Unmarshal(data, &hash); err == nil {
+		if hash["error_msg"] != "" {
+			msg = hash["error_msg"]
+		}
+	}
+
+	return errors.New(msg), nil
+}
+
+func IsDirectoryExist(directory string) (error, []string, bool) {
+	err, files := ListDirectory(directory)
+
+	if err == nil {
+		return nil, files, true
+	}
+
+	if err.Error() == PATH_DOESNT_EXIST_MSG {
+		return nil, nil, false
+	} else {
+		return err, nil, false
+	}
 }
 
 // curl -d  "operation=mkdir" -v  -H 'Authorization: Tokacd9c6ccb8133606d94ff8e61d99b477fd' -H 'Accept: application/json; charset=utf-8; indent=4' https://cloud.seafile.com/api2/repos/dae8cecc-2359-4d33-aa42-01b7846c4b32/dir/?p=/foo
@@ -278,7 +351,7 @@ func CreateDirectory(directory string) error {
 // curl -H "Authorization: Token f2210dacd9c6ccb8133606d94ff8e61d99b477fd" https://cloud.seafile.com/api2/repos/99b758e6-91ab-4265-b705-925367374cf0/upload-link/
 // "http://cloud.seafile.com:8082/upload-api/ef881b22"
 func GetUploadLink() error {
-	return DoSeafileRequest("GET", "/api2/repos/"+default_repo+"/upload-link/", &upload_link)
+	return DoSeafileRequestJSON("GET", "/api2/repos/"+default_repo+"/upload-link/", &upload_link)
 }
 
 // UploadFile API request.
@@ -325,7 +398,6 @@ func UploadFile(src io.Reader, folder, filename, callback_url string) error {
 		return err
 	}
 
-	// TODO: parse response.
 	response_body, err := ioutil.ReadAll(resp.Body)
 	if err != nil {
 		return err
@@ -402,13 +474,34 @@ func uploadHandler(w http.ResponseWriter, r *http.Request) {
 		dir := fetchValue(form.Value["folder"], "/test/")
 		callback_url := fetchValue(form.Value["callback"], "http://localhost:3000/seafile_uploads")
 
-		if err := CreateDirectory(dir); err != nil {
+		err, files_exist, dir_exist := IsDirectoryExist(dir)
+		if err != nil {
 			http.Error(w, err.Error(), http.StatusInternalServerError)
 			return
 		}
 
+		if !dir_exist {
+			if err := CreateDirectory(dir); err != nil {
+				http.Error(w, err.Error(), http.StatusInternalServerError)
+				return
+			}
+		}
+
 		files := form.File["file"]
+		uploaded := 0
 		for i, f := range files {
+			found := false
+			for _, fe := range files_exist {
+				if f.Filename == fe {
+					log.Println("Skipping", dir+fe)
+					found = true
+					break
+				}
+			}
+			if found {
+				continue
+			}
+
 			//for each fileheader, get a handle to the actual file
 			file, err := files[i].Open()
 			defer file.Close()
@@ -424,12 +517,14 @@ func uploadHandler(w http.ResponseWriter, r *http.Request) {
 				http.Error(w, err.Error(), http.StatusInternalServerError)
 				return
 			}
+
+			uploaded++
 		}
 
 		time_taken := time.Since(start)
 
 		//display success message.
-		msg := fmt.Sprintf("Upload successful. Time taken: %v", time_taken)
+		msg := fmt.Sprintf("Upload successful. Time taken: %v. Uploaded %v files", time_taken, uploaded)
 		display(w, "upload", msg)
 	default:
 		w.WriteHeader(http.StatusMethodNotAllowed)
