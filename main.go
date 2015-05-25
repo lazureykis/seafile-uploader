@@ -15,6 +15,7 @@ import (
 	"net/http"
 	"net/url"
 	"os"
+	"strings"
 	"time"
 )
 
@@ -78,7 +79,7 @@ func ConfigureApp() {
 	}
 }
 
-func DoSeafileRequest(method, path string, v interface{}) error {
+func DoSeafileRequest(method, path string, returnData interface{}) error {
 	method_url := seafile_url + path
 
 	client := &http.Client{}
@@ -101,7 +102,7 @@ func DoSeafileRequest(method, path string, v interface{}) error {
 		return err
 	}
 
-	err = json.Unmarshal(data, &v)
+	err = json.Unmarshal(data, &returnData)
 
 	if err != nil {
 		return err
@@ -218,6 +219,60 @@ func GetDefaultRepo() error {
 	return nil
 }
 
+// curl -d  "operation=mkdir" -v  -H 'Authorization: Tokacd9c6ccb8133606d94ff8e61d99b477fd' -H 'Accept: application/json; charset=utf-8; indent=4' https://cloud.seafile.com/api2/repos/dae8cecc-2359-4d33-aa42-01b7846c4b32/dir/?p=/foo
+// ...
+// < HTTP/1.0 201 CREATED
+// < Location: https://cloud.seafile.com/api2/repos/dae8cecc-2359-4d33-aa42-01b7846c4b32/dir/?p=/foo
+// ...
+// "success"
+func CreateDirectory(directory string) error {
+	params := url.Values{"p": {directory}}
+	url_with_params := seafile_url + "/api2/repos/" + default_repo + "/dir/?" + params.Encode()
+
+	log.Println("POST", url_with_params)
+
+	request_body := "operation=mkdir"
+	req, err := http.NewRequest("POST", url_with_params, strings.NewReader(request_body))
+
+	if err != nil {
+		return err
+	}
+	req.Header.Add("Authorization", "Token "+token)
+	req.Header.Add("Accept", "application/json; charset=utf-8")
+	req.Header.Add("Content-Type", "application/x-www-form-urlencoded")
+	req.Header.Add("Content-Length", fmt.Sprintf("%d", len(request_body)))
+
+	client := &http.Client{}
+
+	resp, err := client.Do(req)
+
+	if err != nil {
+		return err
+	}
+
+	response_body, err := ioutil.ReadAll(resp.Body)
+	if err != nil {
+		return err
+	}
+	resp.Body.Close()
+	response := string(response_body)
+	log.Println(response)
+
+	if response != "\"success\"" {
+		var returnData map[string]string
+		err = json.Unmarshal(response_body, &returnData)
+		if err != nil {
+			return err
+		}
+
+		if returnData["error_msg"] != "" {
+			return errors.New("Cannot create directory " + directory + " > " + returnData["error_msg"])
+		}
+	}
+
+	return nil
+}
+
 // Gets link where to upload file.
 // GET https://cloud.seafile.com/api2/repos/{repo-id}/upload-link/
 // curl -H "Authorization: Token f2210dacd9c6ccb8133606d94ff8e61d99b477fd" https://cloud.seafile.com/api2/repos/99b758e6-91ab-4265-b705-925367374cf0/upload-link/
@@ -236,31 +291,31 @@ func GetUploadLink() error {
 // Sample:
 // curl -H "Authorization: Token f2210dacd9c6ccb8133606d94ff8e61d99b477fd" -F file=@test.txt -F filename=test.txt -F parent_dir=/ http://cloud.seafile.com:8082/upload-api/ef881b22
 // "adc83b19e793491b1c6ea0fd8b46cd9f32e592fc"
-func UploadFile(src io.Reader, folder, filename string) error {
+func UploadFile(src io.Reader, folder, filename, callback_url string) error {
 	log.Println("Uploading", folder+filename)
 
-	body := &bytes.Buffer{}
-	writer := multipart.NewWriter(body)
-	part, err := writer.CreateFormFile("file", filename)
+	request_body := &bytes.Buffer{}
+	multipart_writer := multipart.NewWriter(request_body)
+	part, err := multipart_writer.CreateFormFile("file", filename)
 	if err != nil {
 		return err
 	}
 	_, err = io.Copy(part, src)
 
-	writer.WriteField("filename", filename)
-	writer.WriteField("parent_dir", folder)
+	multipart_writer.WriteField("filename", filename)
+	multipart_writer.WriteField("parent_dir", folder)
 
-	err = writer.Close()
+	err = multipart_writer.Close()
 	if err != nil {
 		return err
 	}
 
-	req, err := http.NewRequest("POST", upload_link, body)
+	req, err := http.NewRequest("POST", upload_link, request_body)
 	if err != nil {
 		return err
 	}
 	req.Header.Add("Authorization", "Token "+token)
-	req.Header.Set("Content-Type", writer.FormDataContentType())
+	req.Header.Set("Content-Type", multipart_writer.FormDataContentType())
 
 	client := &http.Client{}
 
@@ -271,20 +326,33 @@ func UploadFile(src io.Reader, folder, filename string) error {
 	}
 
 	// TODO: parse response.
-	rbody, err := ioutil.ReadAll(resp.Body)
+	response_body, err := ioutil.ReadAll(resp.Body)
 	if err != nil {
 		return err
 	}
 	resp.Body.Close()
-	file_hash := string(rbody)
+	response := string(response_body)
 
-	if len(file_hash) != UPLOADED_FILE_HASH_SIZE {
+	if len(response) != UPLOADED_FILE_HASH_SIZE {
 		err_msg := fmt.Sprintf("Cannot upload %s", folder+filename)
 		log.Println(err_msg)
 		return errors.New(err_msg)
 	}
 
-	log.Println("Saved", file_hash, folder+filename)
+	log.Println("Saved", response, folder+filename)
+
+	if callback_url != "" {
+		go func() {
+			params := url.Values{"folder": {folder}, "file": {filename}, "hash": {response}}
+			url_with_params := callback_url + "?" + params.Encode()
+			_, err := http.Get(url_with_params)
+			if err != nil {
+				log.Println(err.Error())
+				return
+			}
+			log.Println("Called back to", callback_url)
+		}()
+	}
 
 	return nil
 }
@@ -297,6 +365,16 @@ func display(w http.ResponseWriter, tmpl string, data interface{}) {
 }
 
 var MAX_FORM_SIZE int64 = 1024 * 1024 * 1024 // 1GB
+
+func fetchValue(values []string, defaultValue string) (value string) {
+	value = defaultValue
+
+	if len(values) > 0 && values[0] != "" {
+		value = values[0]
+	}
+
+	return
+}
 
 func uploadHandler(w http.ResponseWriter, r *http.Request) {
 	log.Println(r.Method, r.RequestURI)
@@ -321,13 +399,12 @@ func uploadHandler(w http.ResponseWriter, r *http.Request) {
 		form := r.MultipartForm
 		defer form.RemoveAll()
 
-		var dir string
-		if len(form.Value["folder"]) > 0 {
-			dir = form.Value["folder"][0]
-		}
+		dir := fetchValue(form.Value["folder"], "/test/")
+		callback_url := fetchValue(form.Value["callback"], "http://localhost:3000/seafile_uploads")
 
-		if dir == "" {
-			dir = "/test/"
+		if err := CreateDirectory(dir); err != nil {
+			http.Error(w, err.Error(), http.StatusInternalServerError)
+			return
 		}
 
 		files := form.File["file"]
@@ -341,7 +418,7 @@ func uploadHandler(w http.ResponseWriter, r *http.Request) {
 				return
 			}
 
-			err = UploadFile(file, dir, f.Filename)
+			err = UploadFile(file, dir, f.Filename, callback_url)
 
 			if err != nil {
 				http.Error(w, err.Error(), http.StatusInternalServerError)
