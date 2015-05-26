@@ -595,7 +595,7 @@ func downloadHandler(w http.ResponseWriter, r *http.Request) {
 				if err == io.EOF {
 					break
 				} else {
-					http.Error(w, err.Error(), http.StatusInternalServerError)
+					// Connection was interrupted.
 					return
 				}
 			}
