@@ -231,6 +231,36 @@ func GetDefaultRepo() error {
 	return nil
 }
 
+// Download File
+// curl  -v  -H 'Authorization: Token f2210dacd9c6ccb8133606d94ff8e61d99b477fd' -H 'Accept: application/json; charset=utf-8; indent=4' https://cloud.seafile.com/api2/repos/dae8cecc-2359-4d33-aa42-01b7846c4b32/file/?p=/foo.c
+// "https://cloud.seafile.com:8082/files/adee6094/foo.c"
+func GetDownloadFileLink(path string) (string, error) {
+	params := url.Values{"p": {path}}
+	var result interface{}
+
+	api_path := "/api2/repos/" + default_repo + "/file/?" + params.Encode()
+	err := DoSeafileRequestJSON("GET", api_path, &result)
+	if err != nil {
+		return "", err
+	}
+
+	switch result.(type) {
+	case string:
+		return result.(string), nil
+	case map[string]interface{}:
+		hash := (result).(map[string]interface{})
+		error_msg := hash["error_msg"]
+		switch error_msg.(type) {
+		case string:
+			return "", errors.New((error_msg).(string))
+		default:
+			return "", errors.New(fmt.Sprintf("Unknown response: %v", result))
+		}
+	default:
+		return "", errors.New(fmt.Sprintf("Unknown response: %v", result))
+	}
+}
+
 // curl -H "Authorization: Token f2210dacd9c6ccb8133606d94ff8e61d9b477fd" -H 'Accept: application/json; indent=4' https://cloud.seafile.com/api2/repos/99b758e6-91ab-4265-b705-925367374cf0/dir/?p=/foo
 // If oid is the latest oid of the directory, returns "uptodate" , else returns
 // [
@@ -531,9 +561,58 @@ func uploadHandler(w http.ResponseWriter, r *http.Request) {
 	}
 }
 
+func downloadHandler(w http.ResponseWriter, r *http.Request) {
+	log.Println(r.Method, r.RequestURI)
+	switch r.Method {
+	case "GET":
+		request_uri, err := url.ParseRequestURI(r.RequestURI)
+		if err != nil {
+			http.Error(w, err.Error(), http.StatusInternalServerError)
+			return
+		}
+
+		path := strings.Replace(request_uri.Path, "/get/", "/", 1)
+
+		link, err := GetDownloadFileLink(path)
+		if err != nil {
+			http.Error(w, err.Error(), http.StatusInternalServerError)
+			return
+		}
+
+		resp, err := http.Get(link)
+		if err != nil {
+			http.Error(w, err.Error(), http.StatusInternalServerError)
+			return
+		}
+		defer resp.Body.Close()
+
+		var buf_size int64 = 1024 * 1024 // 1MB
+
+		for {
+			_, err := io.CopyN(w, resp.Body, buf_size)
+
+			if err != nil {
+				if err == io.EOF {
+					break
+				} else {
+					http.Error(w, err.Error(), http.StatusInternalServerError)
+					return
+				}
+			}
+
+			if f, ok := (w).(http.Flusher); ok {
+				f.Flush()
+			}
+		}
+	default:
+		w.WriteHeader(http.StatusMethodNotAllowed)
+	}
+}
+
 // Start web server after configuration.
 func StartWebServer() {
 	http.HandleFunc("/upload", uploadHandler)
+	http.HandleFunc("/get/", downloadHandler)
 
 	//static file handler.
 	http.Handle("/assets/", http.StripPrefix("/assets/", http.FileServer(http.Dir("assets"))))
