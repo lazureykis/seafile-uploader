@@ -579,31 +579,70 @@ func downloadHandler(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 
-		resp, err := http.Get(link)
+		sfr, err := http.NewRequest("GET", link, nil)
+		if err != nil {
+			http.Error(w, err.Error(), http.StatusInternalServerError)
+			return
+		}
+
+		headers_to_forward := []string{"If-Modified-Since", "Accept", "Accept-Encoding", "Accept-Language", "Cache-Control", "Pragma"}
+		for _, header := range headers_to_forward {
+			header_value_from_request := r.Header.Get(header)
+			if header_value_from_request != "" {
+				sfr.Header.Add(header, header_value_from_request)
+			}
+		}
+
+		client := &http.Client{}
+		resp, err := client.Do(sfr)
 		if err != nil {
 			http.Error(w, err.Error(), http.StatusInternalServerError)
 			return
 		}
 		defer resp.Body.Close()
 
-		var buf_size int64 = 1024 * 1024 // 1MB
+		if r.Header.Get("Connection") == "keep-alive" {
+			w.Header().Add("Connection", "keep-alive")
+		}
 
-		for {
-			_, err := io.CopyN(w, resp.Body, buf_size)
+		switch resp.StatusCode {
+		case 200:
+			headers_to_return := []string{"Cache-Control", "Last-Modified"}
+			w.Header().Add("Access-Control-Allow-Origin", "*")
 
-			if err != nil {
-				if err == io.EOF {
-					break
-				} else {
-					// Connection was interrupted.
-					return
+			for _, header := range headers_to_return {
+				header_value_from_response := resp.Header.Get(header)
+				if header_value_from_response != "" {
+					w.Header().Add(header, header_value_from_response)
 				}
 			}
 
-			if f, ok := (w).(http.Flusher); ok {
-				f.Flush()
+			// Cache-Control:max-age=3600
+			var buf_size int64 = 1024 * 1024 // 1MB
+
+			for {
+				_, err := io.CopyN(w, resp.Body, buf_size)
+
+				if err != nil {
+					if err == io.EOF {
+						break
+					} else {
+						// Connection was interrupted.
+						return
+					}
+				}
+
+				if f, ok := (w).(http.Flusher); ok {
+					f.Flush()
+				}
 			}
+
+		// Status "Not modified" is here too.
+		default:
+			http.Error(w, resp.Status, resp.StatusCode)
+			return
 		}
+
 	default:
 		w.WriteHeader(http.StatusMethodNotAllowed)
 	}
